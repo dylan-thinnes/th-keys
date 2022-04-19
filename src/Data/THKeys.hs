@@ -158,14 +158,17 @@ getTraversalSpecs target = go
 deriveKeyBy :: Name -> Q [Dec]
 deriveKeyBy targetName = do
   DatatypeInfo { datatypeName, datatypeCons, datatypeVars } <- reifyDatatype targetName
-  let targetVar =
+  let (targetVar, unusedVars) =
         if length datatypeVars == 0
           then error "Cannot derive a key for datatype with no type variables"
-          else last datatypeVars
-  let targetVarName =
-        case targetVar of
+          else (last datatypeVars, init datatypeVars)
+
+  let tyVarName tyvar =
+        case tyvar of
           KindedTV name kind -> name
           PlainTV name -> name
+  let targetVarName = tyVarName targetVar
+  let typeWithoutLastVar = foldl AppT (ConT targetName) (VarT . tyVarName <$> unusedVars)
 
   let enumerateKeySpecs :: ConstructorInfo -> [KeySpec]
       enumerateKeySpecs ConstructorInfo { constructorName, constructorFields } = do
@@ -184,7 +187,7 @@ deriveKeyBy targetName = do
   let allKeySpecs = map enumerateKeySpecs datatypeCons
 
   let keyDecl =
-        let datatypeName = AppT (ConT ''Key) (ConT targetName)
+        let datatypeName = AppT (ConT ''Key) typeWithoutLastVar
             conNames = map (\spec -> NormalC (keySpecName spec) []) $ concat allKeySpecs
         in
         DataInstD [] Nothing datatypeName Nothing conNames []
@@ -198,4 +201,4 @@ deriveKeyBy targetName = do
     -}
 
   --pure [InstanceD Nothing [] (ConT ''KeyBy `AppT` ConT targetName) [keyDecl, traverseByKeyDecl, attachKeyDecl]]
-  pure [InstanceD Nothing [] (ConT ''KeyBy `AppT` ConT targetName) [keyDecl, traverseByKeyDecl]]
+  pure [InstanceD Nothing [] (ConT ''KeyBy `AppT` typeWithoutLastVar) [keyDecl, traverseByKeyDecl]]
