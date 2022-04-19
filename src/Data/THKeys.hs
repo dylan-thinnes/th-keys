@@ -73,6 +73,23 @@ keySpecToTraversalHandler spec@KeySpec { traversalSpec, position, conFieldCount,
     (NormalB body)
     []
 
+  {-
+keySpecsToAttachmentHandler :: [KeySpec] -> Maybe Clause
+keySpecsToAttachmentHandler [] = Nothing
+keySpecsToAttachmentHandler specs = Just $
+  let KeySpec { conFieldCount, conName } = head specs
+
+      fieldName i = mkName $ "field" ++ show i
+      fieldNames = map fieldName [0..conFieldCount - 1]
+
+      makeTuple fieldName keyName = TupE [Just (VarE fieldName), Just (ConE keyName)]
+  in
+  Clause
+    [ConP conName (map VarP fieldNames)]
+    (NormalB $ ConE conName `appEs` zipWith makeTuple fieldNames (map keySpecName specs))
+    []
+  -}
+
 data TraversalSpec
   = Found
   | Traverse TraversalSpec
@@ -182,4 +199,10 @@ deriveKeyBy targetName = do
   let traverseByKeyDecl =
         FunD 'traverseByKey (map keySpecToTraversalHandler $ concat allKeySpecs)
 
+    {-
+  let attachKeyDecl =
+        FunD 'attachKey (mapMaybe keySpecsToAttachmentHandler allKeySpecs)
+    -}
+
+  --pure [InstanceD Nothing [] (ConT ''KeyBy `AppT` ConT targetName) [keyDecl, traverseByKeyDecl, attachKeyDecl]]
   pure [InstanceD Nothing [] (ConT ''KeyBy `AppT` ConT targetName) [keyDecl, traverseByKeyDecl]]
