@@ -43,23 +43,24 @@ data KeySpec =
     { typeName :: Name
     , conName :: Name
     , conFieldCount :: Int
-    , position :: Int
+    , fieldPosition :: Int
     , traversalSpec :: TraversalSpec
+    , traversalPosition :: Int
     }
 
 occName :: Name -> String
 occName (Name (OccName str) _) = str
 
 keySpecName :: KeySpec -> Name
-keySpecName KeySpec { conName, position } =
-  mkName $ "Key" ++ occName conName ++ show position
+keySpecName KeySpec { conName, fieldPosition, traversalPosition } =
+  mkName $ "Key" ++ occName conName ++ "F" ++ show fieldPosition ++ "T" ++ show traversalPosition
 
 keySpecToTraversalHandler :: KeySpec -> Clause
-keySpecToTraversalHandler spec@KeySpec { traversalSpec, position, conFieldCount, conName } =
+keySpecToTraversalHandler spec@KeySpec { traversalSpec, fieldPosition, conFieldCount, conName } =
   let handlerName = mkName "handler"
 
       fieldName i = mkName $ "field" ++ show i
-      targetFieldName = fieldName position
+      targetFieldName = fieldName fieldPosition
       fieldNames = map fieldName [0..conFieldCount - 1]
 
       conPat = ConP conName (map VarP fieldNames)
@@ -95,7 +96,6 @@ data TraversalSpec
   | Traverse TraversalSpec
   | TraverseTupleN Int Int TraversalSpec
   | BitraverseLeft TraversalSpec
-  | Bitraverse TraversalSpec TraversalSpec
   deriving (Show, Eq, Ord, Lift)
 
 traversalSpecToCode :: Exp -> TraversalSpec -> Exp
@@ -115,52 +115,43 @@ traversalSpecToCode f = go
     LamE [tupPat] $ VarE 'fmap `appEs` [rewrapElement, (go subspec `AppE` VarE targetElementName)]
   go (BitraverseLeft subspec) =
     AppE (AppE (VarE 'bitraverse) (go subspec)) (VarE 'pure)
-  go (Bitraverse specL specR) =
-    AppE (AppE (VarE 'bitraverse) (go specL)) (go specR)
 
-mkTraversalSpec :: Name -> Type -> Maybe TraversalSpec
-mkTraversalSpec target = go
+getTraversalSpecs :: Name -> Type -> [TraversalSpec]
+getTraversalSpecs target = go
   where
   go type_ =
     let (typeFunc, typeArgs) = flattenAppT type_
     in
     if | length typeArgs == 0
        -> case typeFunc of
-            VarT name | name == target -> Just Found
-            _ -> Nothing
+            VarT name | name == target -> pure Found
+            _ -> []
        | length typeArgs == 1
        -> Traverse <$> go (head typeArgs)
        | length typeArgs >= 2
        -> let matchingIndices =
-                [ (i, spec)
-                | (i, Just spec) <- zip [0..] (map go typeArgs)
+                [ (i, subspec)
+                | (i, subspecs) <- zip [0..] (map go typeArgs)
+                , subspec <- subspecs
                 ]
           in
           case typeFunc of
-            TupleT n ->
-              if | [(n, specLeft), (m, specRight)] <- matchingIndices
-                 , n == length typeArgs - 2
-                 , m == length typeArgs - 1
-                 -> Just $ Bitraverse specLeft specRight
-                 | [(matchingIndex, spec)] <- matchingIndices
-                 -> Just $ TraverseTupleN n matchingIndex spec
-                 | [] <- matchingIndices
-                 -> Nothing
-                 | otherwise
-                 -> error "Tuple has >= 2 traversable type arguments that aren't in the last two positions"
+            TupleT n -> do
+              (matchingIndex, subspec) <- matchingIndices
+              pure $ TraverseTupleN n matchingIndex subspec
             _ ->
               if | [(n, specLeft), (m, specRight)] <- matchingIndices
                  , n == length typeArgs - 2
                  , m == length typeArgs - 1
-                 -> Just $ Bitraverse specLeft specRight
+                 -> [BitraverseLeft specLeft, Traverse specRight]
                  | [(m, spec)] <- matchingIndices
                  , m == length typeArgs - 1
-                 -> Just $ Traverse spec
+                 -> pure $ Traverse spec
                  | [(n, spec)] <- matchingIndices
                  , n == length typeArgs - 2
-                 -> Just $ BitraverseLeft spec
+                 -> pure $ BitraverseLeft spec
                  | [] <- matchingIndices
-                 -> Nothing
+                 -> []
                  | otherwise
                  -> error "Type has traversable type arguments that aren't in the last two positions"
 
@@ -178,14 +169,16 @@ deriveKeyBy targetName = do
 
   let enumerateKeySpecs :: ConstructorInfo -> [KeySpec]
       enumerateKeySpecs ConstructorInfo { constructorName, constructorFields } = do
-        let specs = map (mkTraversalSpec targetVarName) constructorFields
-        (position, Just spec) <- zip [0..] specs
+        let fieldSpecs = map (getTraversalSpecs targetVarName) constructorFields
+        (fieldPosition, specs) <- zip [0..] fieldSpecs
+        (traversalPosition, spec) <- zip [0..] specs
         pure $ KeySpec
           { typeName = datatypeName
           , conName = constructorName
           , conFieldCount = length constructorFields
-          , position = position
+          , fieldPosition = fieldPosition
           , traversalSpec = spec
+          , traversalPosition = traversalPosition
           }
 
   let allKeySpecs = map enumerateKeySpecs datatypeCons
