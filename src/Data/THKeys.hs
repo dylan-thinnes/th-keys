@@ -1,4 +1,5 @@
 {-# LANGUAGE DeriveLift #-}
+{-# LANGUAGE DeriveFunctor, DeriveFoldable, DeriveTraversable #-}
 {-# LANGUAGE TypeFamilies #-}
 {-# LANGUAGE TemplateHaskell #-}
 {-# LANGUAGE MultiWayIf #-}
@@ -16,6 +17,8 @@ import Data.Maybe
 import Data.Functor.Identity
 import Data.Functor.Const
 import Data.Monoid (First (..))
+
+import Control.Monad.State (State (..), get, modify, evalState)
 
 import LiftTH
 
@@ -90,6 +93,34 @@ keySpecsToAttachmentHandler specs = Just $
     (NormalB $ ConE conName `appEs` zipWith makeTuple fieldNames (map keySpecName specs))
     []
 
+data TargetSpecs a
+  = Founds a
+  | Nests (TargetSpecs a)
+  | NestTupleNs Int [(Int, TargetSpecs a)]
+  | BiLefts (TargetSpecs a)
+  | BiBoths (TargetSpecs a) (TargetSpecs a)
+  deriving (Show, Eq, Ord, Lift, Functor, Foldable, Traversable)
+
+divideSpecsWithIdx :: TargetSpecs a -> [(Int, TargetSpec)]
+divideSpecsWithIdx specs = divide $ evalState (traverse withIdx specs) 0
+  where
+    withIdx _ = do
+      i <- get
+      modify succ
+      pure i
+
+    divide :: TargetSpecs a -> [(a, TargetSpec)]
+    divide (Founds a) = pure (a, Found)
+    divide (Nests subspecs) = (fmap . fmap) Nest (divide subspecs)
+    divide (NestTupleNs n idxedSubspecs) = do
+      (idx, subspecs) <- idxedSubspecs
+      subspec <- divide subspecs
+      pure $ NestTupleN n idx <$> subspec
+    divide (BiLefts subspecs) = (fmap . fmap) BiLeft (divide subspecs)
+    divide (BiBoths lspecs rspecs) =
+      (fmap . fmap) BiLeft (divide lspecs) ++ (fmap . fmap) Nest (divide rspecs)
+
+
 data TargetSpec
   = Found
   | Nest TargetSpec
@@ -115,7 +146,7 @@ targetSpecToTraversal f = go
   go (BiLeft subspec) =
     AppE (AppE (VarE 'bitraverse) (go subspec)) (VarE 'pure)
 
-getTargetSpecs :: Name -> Type -> [TargetSpec]
+getTargetSpecs :: Name -> Type -> Maybe (TargetSpecs ())
 getTargetSpecs target = go
   where
   go type_ =
@@ -123,34 +154,32 @@ getTargetSpecs target = go
     in
     if | length typeArgs == 0
        -> case typeFunc of
-            VarT name | name == target -> pure Found
-            _ -> []
+            VarT name | name == target -> pure $ Founds ()
+            _ -> Nothing
        | length typeArgs == 1
-       -> Nest <$> go (head typeArgs)
+       -> Nests <$> go (head typeArgs)
        | length typeArgs >= 2
        -> let matchingIndices =
                 [ (i, subspec)
-                | (i, subspecs) <- zip [0..] (map go typeArgs)
-                , subspec <- subspecs
+                | (i, Just subspec) <- zip [0..] (map go typeArgs)
                 ]
           in
           case typeFunc of
-            TupleT n -> do
-              (matchingIndex, subspec) <- matchingIndices
-              pure $ NestTupleN n matchingIndex subspec
+            TupleT n ->
+              pure $ NestTupleNs n matchingIndices
             _ ->
               if | [(n, specLeft), (m, specRight)] <- matchingIndices
                  , n == length typeArgs - 2
                  , m == length typeArgs - 1
-                 -> [BiLeft specLeft, Nest specRight]
+                 -> pure $ BiBoths specLeft specRight
                  | [(m, spec)] <- matchingIndices
                  , m == length typeArgs - 1
-                 -> pure $ Nest spec
+                 -> pure $ Nests spec
                  | [(n, spec)] <- matchingIndices
                  , n == length typeArgs - 2
-                 -> pure $ BiLeft spec
+                 -> pure $ BiLefts spec
                  | [] <- matchingIndices
-                 -> []
+                 -> Nothing
                  | otherwise
                  -> error "Type has traversable type arguments that aren't in the last two positions"
 
@@ -172,8 +201,8 @@ deriveKeyBy targetName = do
   let enumerateKeySpecs :: ConstructorInfo -> [KeySpec]
       enumerateKeySpecs ConstructorInfo { constructorName, constructorFields } = do
         let fieldSpecs = map (getTargetSpecs targetVarName) constructorFields
-        (fieldPosition, specs) <- zip [0..] fieldSpecs
-        (targetPosition, spec) <- zip [0..] specs
+        (fieldPosition, Just specs) <- zip [0..] fieldSpecs
+        (targetPosition, spec) <- divideSpecsWithIdx specs
         pure $ KeySpec
           { typeName = datatypeName
           , conName = constructorName
