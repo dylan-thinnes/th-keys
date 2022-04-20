@@ -42,12 +42,42 @@ flattenAppT type_ = go type_ []
     go (AppT f arg) args = go f (arg:args)
     go func args = (func, args)
 
-data KeySpec =
+data KeySpecG extra =
   KeySpec
     { typeName :: Name
     , conName :: Name
     , conFieldCount :: Int
-    , fieldPosition :: Int
+    , x :: extra
+    }
+  deriving (Eq, Show, Ord, Functor, Foldable, Traversable)
+
+type KeySpec = KeySpecG FieldedTargetSpecs
+type FieldedTargetSpecs = [(Int, TargetSpecs)]
+
+conInfoToKeySpecMulti :: Name -> Name -> ConstructorInfo -> KeySpec
+conInfoToKeySpecMulti typeName targetVarName ConstructorInfo { constructorName, constructorFields } =
+  KeySpec
+    { typeName
+    , conName = constructorName
+    , conFieldCount = length constructorFields
+    , x = mapMaybe sequence $ zip [0..] $ map (getTargetSpecs targetVarName) constructorFields
+    }
+
+divideFieldedTargetSpecs :: FieldedTargetSpecs -> [FieldedTargetSpec]
+divideFieldedTargetSpecs fieldSpecs = do
+  (fieldPosition, specs) <- fieldSpecs
+  (targetPosition, spec) <- divideSpecsWithIdx specs
+  pure $ FieldedTargetSpec
+    { fieldPosition = fieldPosition
+    , targetSpec = spec
+    , targetPosition = targetPosition
+    }
+
+type KeySpecSingle = KeySpecG FieldedTargetSpec
+
+data FieldedTargetSpec =
+  FieldedTargetSpec
+    { fieldPosition :: Int
     , targetSpec :: TargetSpec
     , targetPosition :: Int
     }
@@ -55,12 +85,16 @@ data KeySpec =
 occName :: Name -> String
 occName (Name (OccName str) _) = str
 
-keySpecName :: KeySpec -> Name
-keySpecName KeySpec { conName, fieldPosition, targetPosition } =
+keySpecSingleName :: KeySpecSingle -> Name
+keySpecSingleName KeySpec { conName, x = FieldedTargetSpec { fieldPosition, targetPosition } } =
+  keyName conName fieldPosition targetPosition
+
+keyName :: Name -> Int -> Int -> Name
+keyName conName fieldPosition targetPosition =
   mkName $ "Key" ++ occName conName ++ "F" ++ show fieldPosition ++ "T" ++ show targetPosition
 
-keySpecToTraversalHandler :: KeySpec -> Clause
-keySpecToTraversalHandler spec@KeySpec { targetSpec, fieldPosition, conFieldCount, conName } =
+keySpecToTraversalHandler :: KeySpecSingle -> Clause
+keySpecToTraversalHandler spec@KeySpec { conFieldCount, conName, x = FieldedTargetSpec { targetSpec, fieldPosition } } =
   let handlerName = mkName "handler"
 
       fieldName i = mkName $ "field" ++ show i
@@ -74,11 +108,11 @@ keySpecToTraversalHandler spec@KeySpec { targetSpec, fieldPosition, conFieldCoun
         appEs (VarE 'fmap) [rewrapField, traverseHandler `AppE` VarE targetFieldName]
   in
   Clause
-    [ConP (keySpecName spec) [], VarP handlerName, conPat]
+    [ConP (keySpecSingleName spec) [], VarP handlerName, conPat]
     (NormalB body)
     []
 
-keySpecsToAttachmentHandler :: [KeySpec] -> Maybe Clause
+keySpecsToAttachmentHandler :: [KeySpecSingle] -> Maybe Clause
 keySpecsToAttachmentHandler [] = Nothing
 keySpecsToAttachmentHandler specs = Just $
   let KeySpec { conFieldCount, conName } = head specs
@@ -90,35 +124,35 @@ keySpecsToAttachmentHandler specs = Just $
   in
   Clause
     [ConP conName (map VarP fieldNames)]
-    (NormalB $ ConE conName `appEs` zipWith makeTuple fieldNames (map keySpecName specs))
+    (NormalB $ ConE conName `appEs` zipWith makeTuple fieldNames (map keySpecSingleName specs))
     []
 
-data TargetSpecs a
+data TargetSpecsF a
   = Founds a
-  | Nests (TargetSpecs a)
-  | NestTupleNs Int [(Int, TargetSpecs a)]
-  | BiLefts (TargetSpecs a)
-  | BiBoths (TargetSpecs a) (TargetSpecs a)
+  | Nests (TargetSpecsF a)
+  | NestTupleNs Int [(Int, TargetSpecsF a)]
+  | BiLefts (TargetSpecsF a)
+  | BiBoths (TargetSpecsF a) (TargetSpecsF a)
   deriving (Show, Eq, Ord, Lift, Functor, Foldable, Traversable)
 
-divideSpecsWithIdx :: TargetSpecs a -> [(Int, TargetSpec)]
-divideSpecsWithIdx specs = divide $ evalState (traverse withIdx specs) 0
-  where
-    withIdx _ = do
-      i <- get
-      modify succ
-      pure i
+type TargetSpecs = TargetSpecsF Int
 
-    divide :: TargetSpecs a -> [(a, TargetSpec)]
-    divide (Founds a) = pure (a, Found)
-    divide (Nests subspecs) = (fmap . fmap) Nest (divide subspecs)
-    divide (NestTupleNs n idxedSubspecs) = do
+targetSpecsToAttachKey :: Name -> Int -> TargetSpec -> Exp
+targetSpecsToAttachKey = undefined
+
+divideSpecsWithIdx :: TargetSpecs -> [(Int, TargetSpec)]
+divideSpecsWithIdx = go
+  where
+    go :: TargetSpecs -> [(Int, TargetSpec)]
+    go (Founds a) = pure (a, Found)
+    go (Nests subspecs) = (fmap . fmap) Nest (go subspecs)
+    go (NestTupleNs n idxedSubspecs) = do
       (idx, subspecs) <- idxedSubspecs
-      subspec <- divide subspecs
+      subspec <- go subspecs
       pure $ NestTupleN n idx <$> subspec
-    divide (BiLefts subspecs) = (fmap . fmap) BiLeft (divide subspecs)
-    divide (BiBoths lspecs rspecs) =
-      (fmap . fmap) BiLeft (divide lspecs) ++ (fmap . fmap) Nest (divide rspecs)
+    go (BiLefts subspecs) = (fmap . fmap) BiLeft (go subspecs)
+    go (BiBoths lspecs rspecs) =
+      (fmap . fmap) BiLeft (go lspecs) ++ (fmap . fmap) Nest (go rspecs)
 
 
 data TargetSpec
@@ -146,9 +180,14 @@ targetSpecToTraversal f = go
   go (BiLeft subspec) =
     AppE (AppE (VarE 'bitraverse) (go subspec)) (VarE 'pure)
 
-getTargetSpecs :: Name -> Type -> Maybe (TargetSpecs ())
-getTargetSpecs target = go
+getTargetSpecs :: Name -> Type -> Maybe TargetSpecs
+getTargetSpecs target type_ = flip evalState 0 . traverse withIdx <$> go type_
   where
+  withIdx _ = do
+    i <- get
+    modify succ
+    pure i
+
   go type_ =
     let (typeFunc, typeArgs) = flattenAppT type_
     in
@@ -198,25 +237,15 @@ deriveKeyBy targetName = do
   let targetVarName = tyVarName targetVar
   let typeWithoutLastVar = foldl AppT (ConT targetName) (VarT . tyVarName <$> unusedVars)
 
-  let enumerateKeySpecs :: ConstructorInfo -> [KeySpec]
-      enumerateKeySpecs ConstructorInfo { constructorName, constructorFields } = do
-        let fieldSpecs = map (getTargetSpecs targetVarName) constructorFields
-        (fieldPosition, Just specs) <- zip [0..] fieldSpecs
-        (targetPosition, spec) <- divideSpecsWithIdx specs
-        pure $ KeySpec
-          { typeName = datatypeName
-          , conName = constructorName
-          , conFieldCount = length constructorFields
-          , fieldPosition = fieldPosition
-          , targetSpec = spec
-          , targetPosition = targetPosition
-          }
+  let enumerateKeySpecs :: ConstructorInfo -> [KeySpecSingle]
+      enumerateKeySpecs =
+        traverse divideFieldedTargetSpecs . conInfoToKeySpecMulti targetName targetVarName
 
   let allKeySpecs = map enumerateKeySpecs datatypeCons
 
   let keyDecl =
         let datatypeName = AppT (ConT ''Key) typeWithoutLastVar
-            conNames = map (\spec -> NormalC (keySpecName spec) []) $ concat allKeySpecs
+            conNames = map (\spec -> NormalC (keySpecSingleName spec) []) $ concat allKeySpecs
         in
         DataInstD [] Nothing datatypeName Nothing conNames []
 
