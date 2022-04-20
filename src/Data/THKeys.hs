@@ -22,6 +22,7 @@ import LiftTH
 class KeyBy f where
   data Key f :: *
   traverseByKey :: Applicative m => Key f -> (a -> m a) -> f a -> m (f a)
+  attachKey :: f a -> f (Key f, a)
 
 setByKey :: KeyBy f => Key f -> (a -> a) -> f a -> f a
 setByKey key handler = runIdentity . traverseByKey key (Identity . handler)
@@ -44,19 +45,19 @@ data KeySpec =
     , conName :: Name
     , conFieldCount :: Int
     , fieldPosition :: Int
-    , traversalSpec :: TraversalSpec
-    , traversalPosition :: Int
+    , targetSpec :: TargetSpec
+    , targetPosition :: Int
     }
 
 occName :: Name -> String
 occName (Name (OccName str) _) = str
 
 keySpecName :: KeySpec -> Name
-keySpecName KeySpec { conName, fieldPosition, traversalPosition } =
-  mkName $ "Key" ++ occName conName ++ "F" ++ show fieldPosition ++ "T" ++ show traversalPosition
+keySpecName KeySpec { conName, fieldPosition, targetPosition } =
+  mkName $ "Key" ++ occName conName ++ "F" ++ show fieldPosition ++ "T" ++ show targetPosition
 
 keySpecToTraversalHandler :: KeySpec -> Clause
-keySpecToTraversalHandler spec@KeySpec { traversalSpec, fieldPosition, conFieldCount, conName } =
+keySpecToTraversalHandler spec@KeySpec { targetSpec, fieldPosition, conFieldCount, conName } =
   let handlerName = mkName "handler"
 
       fieldName i = mkName $ "field" ++ show i
@@ -65,7 +66,7 @@ keySpecToTraversalHandler spec@KeySpec { traversalSpec, fieldPosition, conFieldC
 
       conPat = ConP conName (map VarP fieldNames)
       rewrapField = LamE [VarP targetFieldName] (ConE conName `appEs` map VarE fieldNames)
-      traverseHandler = traversalSpecToCode (VarE handlerName) traversalSpec
+      traverseHandler = targetSpecToTraversal (VarE handlerName) targetSpec
       body =
         appEs (VarE 'fmap) [rewrapField, traverseHandler `AppE` VarE targetFieldName]
   in
@@ -74,7 +75,6 @@ keySpecToTraversalHandler spec@KeySpec { traversalSpec, fieldPosition, conFieldC
     (NormalB body)
     []
 
-  {-
 keySpecsToAttachmentHandler :: [KeySpec] -> Maybe Clause
 keySpecsToAttachmentHandler [] = Nothing
 keySpecsToAttachmentHandler specs = Just $
@@ -89,22 +89,21 @@ keySpecsToAttachmentHandler specs = Just $
     [ConP conName (map VarP fieldNames)]
     (NormalB $ ConE conName `appEs` zipWith makeTuple fieldNames (map keySpecName specs))
     []
-  -}
 
-data TraversalSpec
+data TargetSpec
   = Found
-  | Traverse TraversalSpec
-  | TraverseTupleN Int Int TraversalSpec
-  | BitraverseLeft TraversalSpec
+  | Nest TargetSpec
+  | NestTupleN Int Int TargetSpec
+  | BiLeft TargetSpec
   deriving (Show, Eq, Ord, Lift)
 
-traversalSpecToCode :: Exp -> TraversalSpec -> Exp
-traversalSpecToCode f = go
+targetSpecToTraversal :: Exp -> TargetSpec -> Exp
+targetSpecToTraversal f = go
   where
   go Found = f
-  go (Traverse subspec) =
+  go (Nest subspec) =
     AppE (VarE 'traverse) (go subspec)
-  go (TraverseTupleN n matchingIndex subspec) =
+  go (NestTupleN n matchingIndex subspec) =
     let elementName i = mkName $ "el" ++ show i
         elementNames = map elementName [0..n - 1]
         targetElementName = elementName matchingIndex
@@ -113,11 +112,11 @@ traversalSpecToCode f = go
         rewrapElement = LamE [VarP targetElementName] (TupE $ map (Just . VarE) elementNames)
     in
     LamE [tupPat] $ VarE 'fmap `appEs` [rewrapElement, (go subspec `AppE` VarE targetElementName)]
-  go (BitraverseLeft subspec) =
+  go (BiLeft subspec) =
     AppE (AppE (VarE 'bitraverse) (go subspec)) (VarE 'pure)
 
-getTraversalSpecs :: Name -> Type -> [TraversalSpec]
-getTraversalSpecs target = go
+getTargetSpecs :: Name -> Type -> [TargetSpec]
+getTargetSpecs target = go
   where
   go type_ =
     let (typeFunc, typeArgs) = flattenAppT type_
@@ -127,7 +126,7 @@ getTraversalSpecs target = go
             VarT name | name == target -> pure Found
             _ -> []
        | length typeArgs == 1
-       -> Traverse <$> go (head typeArgs)
+       -> Nest <$> go (head typeArgs)
        | length typeArgs >= 2
        -> let matchingIndices =
                 [ (i, subspec)
@@ -138,18 +137,18 @@ getTraversalSpecs target = go
           case typeFunc of
             TupleT n -> do
               (matchingIndex, subspec) <- matchingIndices
-              pure $ TraverseTupleN n matchingIndex subspec
+              pure $ NestTupleN n matchingIndex subspec
             _ ->
               if | [(n, specLeft), (m, specRight)] <- matchingIndices
                  , n == length typeArgs - 2
                  , m == length typeArgs - 1
-                 -> [BitraverseLeft specLeft, Traverse specRight]
+                 -> [BiLeft specLeft, Nest specRight]
                  | [(m, spec)] <- matchingIndices
                  , m == length typeArgs - 1
-                 -> pure $ Traverse spec
+                 -> pure $ Nest spec
                  | [(n, spec)] <- matchingIndices
                  , n == length typeArgs - 2
-                 -> pure $ BitraverseLeft spec
+                 -> pure $ BiLeft spec
                  | [] <- matchingIndices
                  -> []
                  | otherwise
@@ -172,16 +171,16 @@ deriveKeyBy targetName = do
 
   let enumerateKeySpecs :: ConstructorInfo -> [KeySpec]
       enumerateKeySpecs ConstructorInfo { constructorName, constructorFields } = do
-        let fieldSpecs = map (getTraversalSpecs targetVarName) constructorFields
+        let fieldSpecs = map (getTargetSpecs targetVarName) constructorFields
         (fieldPosition, specs) <- zip [0..] fieldSpecs
-        (traversalPosition, spec) <- zip [0..] specs
+        (targetPosition, spec) <- zip [0..] specs
         pure $ KeySpec
           { typeName = datatypeName
           , conName = constructorName
           , conFieldCount = length constructorFields
           , fieldPosition = fieldPosition
-          , traversalSpec = spec
-          , traversalPosition = traversalPosition
+          , targetSpec = spec
+          , targetPosition = targetPosition
           }
 
   let allKeySpecs = map enumerateKeySpecs datatypeCons
@@ -195,10 +194,8 @@ deriveKeyBy targetName = do
   let traverseByKeyDecl =
         FunD 'traverseByKey (map keySpecToTraversalHandler $ concat allKeySpecs)
 
-    {-
   let attachKeyDecl =
         FunD 'attachKey (mapMaybe keySpecsToAttachmentHandler allKeySpecs)
-    -}
 
-  --pure [InstanceD Nothing [] (ConT ''KeyBy `AppT` ConT targetName) [keyDecl, traverseByKeyDecl, attachKeyDecl]]
+  --pure [InstanceD Nothing [] (ConT ''KeyBy `AppT` typeWithoutLastVar) [keyDecl, traverseByKeyDecl, attachKeyDecl]]
   pure [InstanceD Nothing [] (ConT ''KeyBy `AppT` typeWithoutLastVar) [keyDecl, traverseByKeyDecl]]
