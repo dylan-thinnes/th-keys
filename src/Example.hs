@@ -1,4 +1,5 @@
 {-# LANGUAGE TemplateHaskell #-}
+{-# LANGUAGE DeriveFunctor, DeriveFoldable, DeriveTraversable #-}
 {-# LANGUAGE TypeFamilies #-}
 
 module Example where
@@ -6,6 +7,9 @@ module Example where
 import Data.THKeys
 import Language.Haskell.TH
 import Language.Haskell.TH.Syntax
+
+import Data.Functor.Foldable
+import Data.Functor.Foldable.TH
 
 data X b a
   = A a (Maybe a)
@@ -16,3 +20,6 @@ data X b a
   deriving (Show, Eq, Ord)
 
 deriveKeyBy ''X
+
+makeBaseFunctor ''Exp
+deriveKeyBy ''ExpF
