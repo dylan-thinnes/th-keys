@@ -259,34 +259,40 @@ getTargetSpecs target type_ = flip evalState 0 . traverse withIdx <$> go type_
                  | otherwise
                  -> error "Type has traversable type arguments that aren't in the last two positions"
 
-deriveKeyBy :: Name -> Q [Dec]
-deriveKeyBy targetName = do
-  DatatypeInfo { datatypeName, datatypeCons, datatypeVars } <- reifyDatatype targetName
+deriveKeyFromDatatypeInfo :: Name -> DatatypeInfo -> Dec
+deriveKeyFromDatatypeInfo targetName DatatypeInfo { datatypeName, datatypeCons, datatypeVars } =
   let (targetVar, unusedVars) =
         if length datatypeVars == 0
           then error "Cannot derive a key for datatype with no type variables"
           else (last datatypeVars, init datatypeVars)
 
-  let tyVarName tyvar =
+      tyVarName tyvar =
         case tyvar of
           KindedTV name kind -> name
           PlainTV name -> name
-  let targetVarName = tyVarName targetVar
-  let typeWithoutLastVar = foldl AppT (ConT targetName) (VarT . tyVarName <$> unusedVars)
+      targetVarName = tyVarName targetVar
+      typeWithoutLastVar = foldl AppT (ConT targetName) (VarT . tyVarName <$> unusedVars)
 
-  let allSpecs = conInfoToKeySpecMulti targetName targetVarName <$> datatypeCons
-  let allSingleSpecs = map (traverse divideFieldedTargetSpecs) allSpecs
+      allSpecs = conInfoToKeySpecMulti targetName targetVarName <$> datatypeCons
+      allSingleSpecs = map (traverse divideFieldedTargetSpecs) allSpecs
 
-  let keyDecl =
+      keyDecl =
         let datatypeName = AppT (ConT ''Key) typeWithoutLastVar
             conNames = map (\spec -> NormalC (keySpecSingleName spec) []) $ concat allSingleSpecs
         in
         DataInstD [] Nothing datatypeName Nothing conNames []
 
-  let traverseByKeyDecl =
+      traverseByKeyDecl =
         FunD 'traverseByKey (map keySpecToTraversalHandler $ concat allSingleSpecs)
 
-  let attachKeyDecl =
+      attachKeyDecl =
         FunD 'attachKey (map keySpecsToAttachmentHandler allSpecs)
 
-  pure [InstanceD Nothing [] (ConT ''KeyBy `AppT` typeWithoutLastVar) [keyDecl, traverseByKeyDecl, attachKeyDecl]]
+  in
+  InstanceD Nothing []
+    (ConT ''KeyBy `AppT` typeWithoutLastVar)
+    [keyDecl, traverseByKeyDecl, attachKeyDecl]
+
+deriveKeyBy :: Name -> Q [Dec]
+deriveKeyBy targetName =
+  pure . deriveKeyFromDatatypeInfo targetName <$> reifyDatatype targetName
