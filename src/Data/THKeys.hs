@@ -12,6 +12,7 @@ import Language.Haskell.TH.Syntax
 import Language.Haskell.TH.Datatype
 
 import Data.Bitraversable
+import Data.Bifunctor
 import Data.Maybe
 
 import Data.Functor.Identity
@@ -112,19 +113,25 @@ keySpecToTraversalHandler spec@KeySpec { conFieldCount, conName, x = FieldedTarg
     (NormalB body)
     []
 
-keySpecsToAttachmentHandler :: [KeySpecSingle] -> Maybe Clause
-keySpecsToAttachmentHandler [] = Nothing
-keySpecsToAttachmentHandler specs = Just $
-  let KeySpec { conFieldCount, conName } = head specs
-
-      fieldName i = mkName $ "field" ++ show i
+keySpecsToAttachmentHandler :: KeySpec -> Clause
+keySpecsToAttachmentHandler KeySpec { conFieldCount, conName, x = fieldedTargetSpecss } =
+  let fieldName i = mkName $ "field" ++ show i
       fieldNames = map fieldName [0..conFieldCount - 1]
 
       makeTuple fieldName keyName = TupE [Just (VarE fieldName), Just (ConE keyName)]
+
+      makeFieldHandler :: Int -> Maybe TargetSpecs -> Exp
+      makeFieldHandler fieldPosition Nothing = VarE (fieldName fieldPosition)
+      makeFieldHandler fieldPosition (Just fieldedTargetSpecss) =
+        let handler = targetSpecsToAttachKey conName fieldPosition fieldedTargetSpecss
+        in
+        handler `AppE` VarE (fieldName fieldPosition)
   in
   Clause
     [ConP conName (map VarP fieldNames)]
-    (NormalB $ ConE conName `appEs` zipWith makeTuple fieldNames (map keySpecSingleName specs))
+    (NormalB $
+      appEs (ConE conName) $
+        zipWith makeFieldHandler [0..] (mapIntoList conFieldCount fieldedTargetSpecss))
     []
 
 data TargetSpecsF a
@@ -137,8 +144,38 @@ data TargetSpecsF a
 
 type TargetSpecs = TargetSpecsF Int
 
-targetSpecsToAttachKey :: Name -> Int -> TargetSpec -> Exp
-targetSpecsToAttachKey = undefined
+mapIntoList :: Int -> [(Int, a)] -> [Maybe a]
+mapIntoList targetLength = go 0
+  where
+    go n [] = replicate (targetLength - n) Nothing
+    go n list@((m, x) : rest)
+      | n < m = Nothing : go (n + 1) list
+      | otherwise = Just x : go (n + 1) rest
+
+targetSpecsToAttachKey :: Name -> Int -> TargetSpecs -> Exp
+targetSpecsToAttachKey conName fieldPosition = go
+  where
+    go :: TargetSpecs -> Exp
+    go (Founds targetPosition) =
+      let lamx = mkName "x"
+      in
+      LamE [VarP lamx] $
+        TupE
+          [ Just $ ConE $ keyName conName fieldPosition targetPosition
+          , Just $ VarE lamx
+          ]
+    go (Nests subspec) = AppE (VarE 'fmap) (go subspec)
+    go (NestTupleNs n indexedSubspecs) =
+      let maySubspecs = mapIntoList n indexedSubspecs
+          x n = mkName $ "x" ++ show n
+          allXs = map x [0..length maySubspecs - 1]
+          genMaySubspec Nothing name = Just $ VarE name
+          genMaySubspec (Just subspec) name = Just $ AppE (go subspec) (VarE name)
+      in
+      LamE [TupP (map VarP allXs)] (TupE (zipWith genMaySubspec maySubspecs allXs))
+    go (BiLefts subspec) = AppE (VarE 'first) (go subspec)
+    go (BiBoths lspec rspec) = appEs (VarE 'bimap) [go lspec, go rspec]
+
 
 divideSpecsWithIdx :: TargetSpecs -> [(Int, TargetSpec)]
 divideSpecsWithIdx = go
@@ -237,23 +274,19 @@ deriveKeyBy targetName = do
   let targetVarName = tyVarName targetVar
   let typeWithoutLastVar = foldl AppT (ConT targetName) (VarT . tyVarName <$> unusedVars)
 
-  let enumerateKeySpecs :: ConstructorInfo -> [KeySpecSingle]
-      enumerateKeySpecs =
-        traverse divideFieldedTargetSpecs . conInfoToKeySpecMulti targetName targetVarName
-
-  let allKeySpecs = map enumerateKeySpecs datatypeCons
+  let allSpecs = conInfoToKeySpecMulti targetName targetVarName <$> datatypeCons
+  let allSingleSpecs = map (traverse divideFieldedTargetSpecs) allSpecs
 
   let keyDecl =
         let datatypeName = AppT (ConT ''Key) typeWithoutLastVar
-            conNames = map (\spec -> NormalC (keySpecSingleName spec) []) $ concat allKeySpecs
+            conNames = map (\spec -> NormalC (keySpecSingleName spec) []) $ concat allSingleSpecs
         in
         DataInstD [] Nothing datatypeName Nothing conNames []
 
   let traverseByKeyDecl =
-        FunD 'traverseByKey (map keySpecToTraversalHandler $ concat allKeySpecs)
+        FunD 'traverseByKey (map keySpecToTraversalHandler $ concat allSingleSpecs)
 
   let attachKeyDecl =
-        FunD 'attachKey (mapMaybe keySpecsToAttachmentHandler allKeySpecs)
+        FunD 'attachKey (map keySpecsToAttachmentHandler allSpecs)
 
-  --pure [InstanceD Nothing [] (ConT ''KeyBy `AppT` typeWithoutLastVar) [keyDecl, traverseByKeyDecl, attachKeyDecl]]
-  pure [InstanceD Nothing [] (ConT ''KeyBy `AppT` typeWithoutLastVar) [keyDecl, traverseByKeyDecl]]
+  pure [InstanceD Nothing [] (ConT ''KeyBy `AppT` typeWithoutLastVar) [keyDecl, traverseByKeyDecl, attachKeyDecl]]
