@@ -2,7 +2,7 @@
 {-# LANGUAGE DeriveFunctor, DeriveFoldable, DeriveTraversable #-}
 {-# LANGUAGE TypeFamilies #-}
 
-module Example where
+module Main where
 
 import Data.THKeys
 import Language.Haskell.TH
@@ -10,6 +10,9 @@ import Language.Haskell.TH.Syntax
 
 import Data.Functor.Foldable
 import Data.Functor.Foldable.TH
+
+main :: IO ()
+main = pure ()
 
 data X b a
   = A a (Maybe a)

@@ -21,8 +21,6 @@ import Data.Monoid (First (..))
 
 import Control.Monad.State (State (..), get, modify, evalState)
 
-import LiftTH
-
 class KeyBy f where
   data Key f :: *
   traverseByKey :: Applicative m => Key f -> (a -> m a) -> f a -> m (f a)
